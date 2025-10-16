@@ -812,7 +812,7 @@ class ConfigHandler
       "-Port=#{config['server_game_port']}",
       "-QueryPort=#{config['server_query_port']}",
       "-log=#{config['id']}.log",
-      "-LogCmds=LogGameplayEvents Log",
+      "-LogCmds=LogGameplayEvents Verbose",
       "-LOCALLOGTIMES",
       "-AdminList=Admins",
       "-MapCycle=MapCycle"

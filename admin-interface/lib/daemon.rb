@@ -198,6 +198,298 @@ class SandstormServerDaemon
     end
   end
 
+  def process_kill_event(line)
+    # Parse kill event from LogGameplayEvents
+    # Format: PlayerName[SteamID, team X] killed VictimName[SteamID, team Y] with WeaponName
+    # or: PlayerName[SteamID, team X] + AssistName[SteamID, team X] killed VictimName[SteamID, team Y] with WeaponName
+    return unless line.match(/LogGameplayEvents.*killed/)
+    
+    begin
+      # Extract the main kill information
+      if line =~ /Display: (.+?) killed (.+?) with (.+?)$/
+        killer_info = $1
+        victim_info = $2
+        weapon_raw = $3.strip
+        
+        # Clean weapon name (remove BP_ prefix and _C_ suffix with numbers)
+        weapon_name = weapon_raw
+          .gsub(/^BP_/, '')                    # Remove BP_ prefix
+          .gsub(/_C_\d+$/, '')                 # Remove _C_12345 suffix
+          .gsub(/_/, ' ')                      # Replace underscores with spaces
+          .gsub(/^(Firearm|Projectile|Character|Weapon|Explosive)\s+/, '') # Remove common prefixes
+          .strip                               # Clean up any extra whitespace
+        
+        # Check if it's an assist kill (contains +)
+        has_assist = killer_info.include?('+')
+        
+        # Parse killer (first player before + or the only player)
+        if has_assist
+          killer_part = killer_info.split('+').first.strip
+        else
+          killer_part = killer_info.strip
+        end
+        
+        # Extract killer steam ID and name
+        if killer_part =~ /^(.+?)\[(\d{17}),\s*team\s*(\d+)\]$/
+          killer_name = $1.strip
+          killer_steam_id = $2
+          killer_team = $3.to_i
+        elsif killer_part =~ /^(.+?)\[INVALID,\s*team\s*(\d+)\]$/ || killer_part == '?'
+          # Bot killed someone or self-kill - skip killer tracking
+          killer_name = $1 ? $1.strip : '?'
+          killer_steam_id = nil
+          killer_team = $2 ? $2.to_i : -1
+        else
+          return # Can't parse killer
+        end
+        
+        # Extract victim steam ID and name
+        if victim_info =~ /^(.+?)\[(INVALID|(\d{17})),\s*team\s*(\d+)\]$/
+          victim_name = $1.strip
+          victim_steam_id = $3 # Will be nil for bots (INVALID)
+          victim_team = $4.to_i
+          is_bot_victim = $2 == 'INVALID'
+        else
+          return # Can't parse victim
+        end
+        
+        # Check if it's a suicide
+        is_suicide = (killer_steam_id == victim_steam_id)
+        
+        # Check if it's a teamkill
+        is_teamkill = (killer_team == victim_team) && !is_suicide
+        
+        # Only track stats for real players (not bots)
+        if killer_steam_id && killer_steam_id.match?(/^\d{17}$/)
+          saved_killer = $config_handler.players[killer_steam_id]
+          
+          if is_suicide
+            # Track deaths for suicide
+            saved_killer['total_deaths'] = saved_killer['total_deaths'].to_i + 1
+            log "#{killer_name} committed suicide with #{weapon_name}", level: :debug
+          elsif is_teamkill
+            # Track teamkills separately - DON'T count as regular kills
+            saved_killer['total_teamkills'] = saved_killer['total_teamkills'].to_i + 1
+            log "#{killer_name} teamkilled #{victim_name} with #{weapon_name}", level: :debug
+          else
+            # Track regular kills (enemy kills only)
+            saved_killer['total_kills'] = saved_killer['total_kills'].to_i + 1
+            
+            # Track weapon kills (only for enemy kills)
+            saved_killer['weapons'] = {} if saved_killer['weapons'].nil?
+            saved_killer['weapons'][weapon_name] = saved_killer['weapons'][weapon_name].to_i + 1
+            
+            log "#{killer_name} killed #{is_bot_victim ? 'bot' : victim_name} with #{weapon_name}", level: :debug
+          end
+        end
+        
+        # Track deaths for victim if they're a real player
+        # DON'T count deaths from teamkills or suicides
+        if victim_steam_id && victim_steam_id.match?(/^\d{17}$/) && !is_suicide && !is_teamkill
+          saved_victim = $config_handler.players[victim_steam_id]
+          saved_victim['total_deaths'] = saved_victim['total_deaths'].to_i + 1
+        end
+        
+        # Save player data after updating kill/death stats
+        $config_handler.write_player_info
+        
+      end
+    rescue => e
+      log "Failed to process kill event: #{line}", e
+    end
+  end
+
+  def process_chat_command(line)
+    # Parse chat command from LogChat
+    # Format: LogChat: Display: PlayerName(SteamID) Global Chat: !command
+    # Note: Line may have been filtered already, removing "LogChat: Display:"
+    
+    log "Chat line detected: #{line}", level: :info
+    
+    begin
+      # The chat filter has already removed "LogChat: Display:" prefix
+      # So the line format is now: 2025/10/15 18:58:53 PlayerName(SteamID) Global Chat: !command
+      # OR original format: [2025.10.15-18.58.53:100][833]LogChat: Display: PlayerName(SteamID) Global Chat: !command
+      
+      # Match the format with or without "LogChat: Display:"
+      match = line.match(/(.+?)\((\d{17})\)\s+Global Chat:\s*(.+)$/)
+      if match
+        log "Regex matched! Groups: #{match.captures.inspect}", level: :info
+        
+        player_name = match[1].strip
+        # Remove timestamp if present (format: 2025/10/15 18:58:53 PlayerName)
+        player_name.gsub!(/^\d{4}\/\d{2}\/\d{2}\s+\d{2}:\d{2}:\d{2}\s+/, '')
+        
+        steam_id = match[2]
+        message = match[3].strip
+        
+        # Only process if it's a command (starts with !)
+        unless message.start_with?('!')
+          log "Not a command (no ! prefix): #{message}", level: :info
+          return
+        end
+        
+        log "Chat command parsed - Player: #{player_name}, SteamID: #{steam_id}, Message: #{message}", level: :info
+        
+        # Get player data
+        player = $config_handler.players[steam_id]
+        if player.nil?
+          log "Player data not found for SteamID: #{steam_id}", level: :warn
+          return
+        end
+        
+        log "Player data loaded: #{player.inspect}", level: :info
+        
+        # Process commands
+        command = message.downcase.split.first
+        log "Processing command: #{command}", level: :info
+        
+        case command
+        when '!kdr'
+          handle_kdr_command(player_name, steam_id, player)
+        when '!stats'
+          handle_stats_command(player_name, steam_id, player)
+        when '!guns', '!weapons'
+          handle_guns_command(player_name, steam_id, player)
+        when '!top', '!leaderboard'
+          handle_top_command(player_name, steam_id)
+        else
+          log "Unknown command: #{command}", level: :info
+        end
+      else
+        log "Chat line did not match command regex: #{line}", level: :info
+      end
+    rescue => e
+      log "Failed to process chat command: #{line}", e
+    end
+  end
+
+  def handle_kdr_command(player_name, steam_id, player)
+    log "=== KDR Command Handler ===", level: :info
+    kills = player['total_kills'] || 0
+    deaths = player['total_deaths'] || 0
+    kd_ratio = deaths > 0 ? (kills.to_f / deaths).round(2) : kills.to_f
+    
+    log "Player stats - Kills: #{kills}, Deaths: #{deaths}, K/D: #{kd_ratio}", level: :info
+    
+    response = "#{player_name}: #{kills}K / #{deaths}D | K/D: #{kd_ratio}"
+    log "Sending KDR response: #{response}", level: :info
+    send_chat_message(response)
+    log "KDR command completed for #{player_name}", level: :info
+  end
+
+  def handle_stats_command(player_name, steam_id, player)
+    log "=== Stats Command Handler ===", level: :info
+    total_score = player['total_score'] || 0
+    total_duration = player['total_duration'] || 0
+    
+    log "Player stats - Score: #{total_score}, Duration: #{total_duration}s", level: :info
+    
+    # Calculate score per minute
+    if total_duration > 0
+      minutes = total_duration / 60.0
+      score_per_min = (total_score / minutes).round(1)
+    else
+      score_per_min = 0.0
+    end
+    
+    # Format playtime
+    hours = total_duration / 3600
+    mins = (total_duration % 3600) / 60
+    
+    response = "#{player_name}: Score: #{total_score} | Score/min: #{score_per_min} | Playtime: #{hours}h #{mins}m"
+    log "Sending Stats response: #{response}", level: :info
+    send_chat_message(response)
+    log "Stats command completed for #{player_name}", level: :info
+  end
+
+  def handle_guns_command(player_name, steam_id, player)
+    log "=== Guns Command Handler ===", level: :info
+    weapons = player['weapons'] || {}
+    
+    log "Player weapons: #{weapons.inspect}", level: :info
+    
+    if weapons.empty?
+      response = "#{player_name}: No weapon kills recorded yet"
+    else
+      # Get top 3 weapons
+      top_weapons = weapons.sort_by { |_, kills| -kills }.take(3)
+      
+      weapon_list = top_weapons.map { |(weapon, kills)| "#{weapon}:#{kills}" }.join(' | ')
+      response = "#{player_name}: #{weapon_list}"
+    end
+    
+    log "Sending Guns response: #{response}", level: :info
+    send_chat_message(response)
+    log "Guns command completed for #{player_name}", level: :info
+  end
+
+  def handle_top_command(player_name, steam_id)
+    log "=== Top Command Handler ===", level: :info
+    
+    # Get all players with valid stats
+    players_with_stats = []
+    
+    $config_handler.players.each do |sid, player|
+      next if player.nil?
+      
+      total_score = player['total_score'].to_i
+      total_duration = player['total_duration'].to_i
+      
+      # Only include players with at least 1 minute of playtime
+      next if total_duration < 60
+      
+      # Calculate score per minute
+      minutes = total_duration / 60.0
+      score_per_min = (total_score / minutes).round(1)
+      
+      players_with_stats << {
+        name: player['display_name'] || player['name'] || 'Unknown',
+        score_per_min: score_per_min,
+        total_score: total_score,
+        playtime_mins: minutes.round(0)
+      }
+    end
+    
+    log "Found #{players_with_stats.size} players with stats", level: :info
+    
+    if players_with_stats.empty?
+      response = "Top Players: No stats available yet"
+    else
+      # Sort by score_per_min descending and take top 3
+      top_players = players_with_stats.sort_by { |p| -p[:score_per_min] }.take(3)
+      
+      # Format: "Top 3: 1. PlayerName:12.5 | 2. Player2:10.3 | 3. Player3:8.7"
+      leaderboard = top_players.each_with_index.map do |player, idx|
+        "#{idx + 1}. #{player[:name]}:#{player[:score_per_min]}"
+      end.join(' | ')
+      
+      response = "Top 3 (Score/min): #{leaderboard}"
+    end
+    
+    log "Sending Top response: #{response}", level: :info
+    send_chat_message(response)
+    log "Top command completed", level: :info
+  end
+
+  def send_chat_message(message)
+    log "=== Sending Chat Message ===", level: :info
+    log "Message: #{message}", level: :info
+    log "RCON Details - IP: #{@rcon_ip}, Port: #{@active_rcon_port}, Pass: #{@active_rcon_pass ? '[SET]' : '[NOT SET]'}", level: :info
+    
+    # Send message via RCON
+    Thread.new do
+      begin
+        log "Executing RCON command: say #{message}", level: :info
+        result = @rcon_client.send(@rcon_ip, @active_rcon_port, @active_rcon_pass, "say #{message}")
+        log "RCON command result: #{result.inspect}", level: :info
+        log "Chat message sent successfully", level: :info
+      rescue => e
+        log "Failed to send chat message: #{message}", e
+      end
+    end
+  end
+
   def implode
     log "Daemon for server #{@name} (#{@config['id']}) imploding", level: :info
     @exit_requested = true
@@ -333,9 +625,15 @@ class SandstormServerDaemon
               if line.include? 'LogChat'
                 @chat_buffer[:filters].each { |filter| filter.call(line) } # Remove color codes; add server ID
                 @chat_buffer.synchronize { @chat_buffer.push line.chomp }
+                # Process chat commands
+                log "processing chat", level: :info
+                process_chat_command(line)
               elsif last_line_was_rcon
                 @buffer[:filters].each { |filter| filter.call(line) } # Remove color codes; add server ID
                 @rcon_buffer.synchronize { @rcon_buffer.push line.chomp }
+              elsif line.include?('LogGameplayEvents') && line.include?('killed')
+                # Process kill/death events for player statistics
+                process_kill_event(line)
               end
             end
           end

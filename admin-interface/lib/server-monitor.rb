@@ -117,6 +117,13 @@ class ServerMonitor
     players_joined = rcon_players.reject { |current| prev_rcon_players.map { |prev| prev['steam_id'] }.include?(current['steam_id']) }
 
     now = Time.now.to_i
+    
+    # Initialize session start for existing players who don't have it set
+    rcon_players.each do |player|
+      saved_player = $config_handler.players[player['steam_id']]
+      saved_player['session_start'] = now if saved_player['session_start'].nil?
+    end
+    
     # Look up players we haven't in the past 24 hours
     if @daemon_handle && (@steam_api_client || !@daemon_handle.steam_api_key.empty?)
       @steam_api_client = SteamApiClient.new(@daemon_handle.steam_api_key) if @steam_api_client.nil?
@@ -161,6 +168,10 @@ class ServerMonitor
 
     # Welcome joined players
     players_joined.each do |player|
+      # Track session start time for duration calculation
+      saved_player = $config_handler.players[player['steam_id']]
+      saved_player['session_start'] = now
+      
       if @daemon_handle
         is_admin = @daemon_handle.is_sandstorm_admin?(player['steam_id'])
         message_option = is_admin ? 'admin_join_message' : 'join_message'
@@ -191,7 +202,7 @@ class ServerMonitor
           # Remote monitor external IP
           ip = @ip.dup
         end
-        next if ip.empty?
+        next if ip.nil? || ip.empty?
       else
         ip = player['ip']
       end
@@ -243,23 +254,63 @@ class ServerMonitor
       saved_player['last_seen'] = now
       saved_player['last_server'] = @info.dig(:a2s_info, 'name') || (@daemon_handle && @daemon_handle.name)
       begin
+        duration_seconds = nil
+        
+        # Try to match by exact name first
         matching_a2s_player = @info[:a2s_player].select { |p| p['name'] == player['name'] }.first
-        if matching_a2s_player.nil? && @info[:a2s_player].map { |p| p['name'].empty? }.size == 1
-          # Sometimes A2S_PLAYER has one or more blank player names for a while (bug)
-          # If there's only one, we can assume that this is the player we're unable to match by name
-          matching_a2s_player = @info[:a2s_player].map { |p| p['name'].empty? }.first
+        
+        # Fallback: if we can't match by name and there's exactly one player with empty name, use that
+        if matching_a2s_player.nil?
+          empty_name_players = @info[:a2s_player].select { |p| p['name'].nil? || p['name'].empty? }
+          if empty_name_players.size == 1
+            # Sometimes A2S_PLAYER has blank player names for a while (server bug)
+            # If there's only one, we can assume that this is the player we're unable to match by name
+            matching_a2s_player = empty_name_players.first
+            log "Matched player '#{player['name']}' to A2S player with empty name", level: :debug
+          end
         end
-        duration_steam = matching_a2s_player['duration'] rescue nil
-        raise "Couldn't match by player name (#{player['name']}) to get duration. A2S_PLAYER: #{@info[:a2s_player]}" if duration_steam.nil?
-        duration_seconds = steam_duration_to_seconds(duration_steam) + (@interval / 2.0).floor # Assume they left ~halfway between the last check and now
-        saved_player['last_duration'] = seconds_to_steam_duration(duration_seconds)
-        saved_player['longest_duration'] = seconds_to_steam_duration(duration_seconds) if saved_player['longest_duration'].to_i <= duration_seconds
-        saved_player['total_duration'] = saved_player['total_duration'].to_i + duration_seconds
+        
+        if matching_a2s_player && matching_a2s_player['duration']
+          # We found A2S data with duration - use it
+          duration_steam = matching_a2s_player['duration']
+          duration_seconds = steam_duration_to_seconds(duration_steam) + (@interval / 2.0).floor
+          log "Got A2S duration for '#{player['name']}': #{duration_steam} (#{duration_seconds}s)", level: :debug
+        else
+          # Fallback: estimate duration based on session start time
+          # This ensures duration tracking works even when A2S data is unavailable
+          session_start = saved_player['session_start'] || saved_player['first_seen'] || saved_player['last_seen'] || (now - @interval)
+          estimated_duration = now - session_start.to_i
+          
+          # Only use estimated duration if it seems reasonable (between 1 second and 24 hours)
+          if estimated_duration > 0 && estimated_duration < (24 * 60 * 60)
+            duration_seconds = estimated_duration
+            log "Estimated session duration for '#{player['name']}': #{duration_seconds}s (A2S data unavailable)", level: :debug
+          else
+            # If estimation seems unreasonable, use a minimum session time
+            duration_seconds = @interval || 30  # Use monitoring interval or 30 seconds as fallback
+            log "Using minimum session duration for '#{player['name']}': #{duration_seconds}s (estimation failed)", level: :debug
+          end
+        end
+        
+        # Update duration stats
+        if duration_seconds && duration_seconds > 0
+          saved_player['last_duration'] = seconds_to_steam_duration(duration_seconds)
+          saved_player['longest_duration'] = seconds_to_steam_duration(duration_seconds) if saved_player['longest_duration'].to_i <= duration_seconds
+          saved_player['total_duration'] = saved_player['total_duration'].to_i + duration_seconds
+          log "Updated duration stats for '#{player['name']}': session=#{seconds_to_steam_duration(duration_seconds)}, total=#{seconds_to_steam_duration(saved_player['total_duration'])}", level: :info
+        else
+          log "Warning: Invalid duration calculated for '#{player['name']}': #{duration_seconds}s", level: :warn
+        end
+        
+        # Clean up session tracking since player has left
+        saved_player.delete('session_start')
       rescue => e
         log "Failed to calculate duration_seconds for saved player info", e
       end
       saved_player['known_ips'] = saved_player['known_ips'].to_a.push(player['ip']).uniq
     end
+    # Save updated player info to disk
+    $config_handler.write_player_info
   rescue => e
     log "Error occurred during RCON player processing", e
   end
