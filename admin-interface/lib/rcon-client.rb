@@ -250,7 +250,9 @@ class RconClient
     end
     log "#{socket.remote_host.ljust(21)} Reading #{size} (+2) bytes"
     response, _ = if IO.select([socket], nil, nil, timeout)
-      socket.recv(size + 2)[0..-3] # Discard last two null bytes
+      data = socket.recv(size + 2)[0..-3] # Discard last two null bytes
+      data.force_encoding('UTF-8') if data # Force UTF-8 encoding to handle special characters
+      data
     end
     # Handle retries
     if response.nil?
@@ -287,12 +289,14 @@ class RconClient
       break if size == 0
       log "#{socket.remote_host.ljust(21)} Reading additional #{size} (+2) bytes"
       additional_response, _ = if IO.select([socket], nil, nil, timeout)
-        socket.recv(size + 2)[0..-3] # Discard last two null bytes
+        data = socket.recv(size + 2)[0..-3] # Discard last two null bytes
+        data.force_encoding('UTF-8') if data # Force UTF-8 encoding to handle special characters
+        data
       end
       break if additional_header.nil?
       log "#{socket.remote_host.ljust(21)} Read additional response: #{additional_response.inspect}"
       additional_responses = true
-      response = '' if response.nil?
+      response = ''.force_encoding('UTF-8') if response.nil? # Initialize with UTF-8 encoding
       response << additional_response
     end
 

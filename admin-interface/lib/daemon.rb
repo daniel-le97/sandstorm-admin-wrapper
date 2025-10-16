@@ -259,9 +259,16 @@ class SandstormServerDaemon
         # Check if it's a teamkill
         is_teamkill = (killer_team == victim_team) && !is_suicide
         
+        # Debug logging for suicide/teamkill detection
+        if killer_steam_id == victim_steam_id
+          log "Suicide detected: killer=#{killer_steam_id}, victim=#{victim_steam_id}, weapon=#{weapon_name}", level: :info
+        end
+        
         # Only track stats for real players (not bots)
         if killer_steam_id && killer_steam_id.match?(/^\d{17}$/)
           saved_killer = $config_handler.players[killer_steam_id]
+          
+          log "Processing kill event: killer=#{killer_name}(#{killer_steam_id}), victim=#{victim_name}(#{victim_steam_id || 'BOT'}), suicide=#{is_suicide}, teamkill=#{is_teamkill}, weapon=#{weapon_name}", level: :info
           
           if is_suicide
             # Track deaths for suicide
