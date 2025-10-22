@@ -422,7 +422,7 @@ class SandstormServerDaemon
       # Get top 3 weapons
       top_weapons = weapons.sort_by { |_, kills| -kills }.take(3)
       
-      weapon_list = top_weapons.map { |(weapon, kills)| "#{weapon}:#{kills}" }.join(' | ')
+      weapon_list = top_weapons.map { |(weapon, kills)| "#{weapon}: #{kills}" }.join(' | ')
       response = "#{player_name}: #{weapon_list}"
     end
     
@@ -641,6 +641,35 @@ class SandstormServerDaemon
               elsif line.include?('LogGameplayEvents') && line.include?('killed')
                 # Process kill/death events for player statistics
                 process_kill_event(line)
+              end
+              # Detect game over and update stats for all connected players
+              if line.include?('LogMapVoteManager: Display: Starting map vote')
+                log "Game over detected in log. Updating stats for all connected players.", level: :info
+                now = Time.now.to_i
+                # You may need to get the current player list from the monitor or rcon_client
+                if defined?(@monitor) && @monitor && @monitor.info[:rcon_players]
+                  @monitor.info[:rcon_players].each do |player|
+                    saved_player = $config_handler.players[player['steam_id']]
+                    next if saved_player.nil? || player['steam_id'].nil? || player['steam_id'].empty?
+                    # Add session score to total_score
+                    if player['score']
+                      session_score = player['score'].to_i
+                      saved_player['total_score'] = saved_player['total_score'].to_i + session_score
+                      log "[Game Over] Added #{session_score} to total_score for #{player['name']} (#{player['steam_id']})", level: :info
+                    end
+                    # Add session duration to total_duration
+                    if saved_player['session_start']
+                      session_duration = now - saved_player['session_start'].to_i
+                      if session_duration > 0
+                        saved_player['total_duration'] = saved_player['total_duration'].to_i + session_duration
+                        log "[Game Over] Added #{session_duration}s to total_duration for #{player['name']} (#{player['steam_id']})", level: :info
+                      end
+                      saved_player['session_start'] = now # Reset session start for next match
+                    end
+                  end
+                  $config_handler.write_player_info
+                  log "[Game Over] Updated stats for all connected players.", level: :info
+                end
               end
             end
           end
